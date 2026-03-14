@@ -29,3 +29,11 @@ The output dataset ranks players by projected home run totals for the 2026 seaso
 Output file:
 
 `projected_2026_hr_dataset.csv`
+
+## 2026 HR Projection Leaders
+
+![Projection Chart](hr_projection_chart.png)
+
+## Interactive Leaderboard
+
+Open `hr_leaderboard.html` to view a scrollable leaderboard of the top projected home run hitters.
