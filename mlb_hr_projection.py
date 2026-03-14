@@ -23,6 +23,11 @@ OUTPUT_FILE = "projected_2026_hr_dataset.csv"
 SEASONS = [2022, 2023, 2024, 2025]
 MIN_PA = 150
 
+# realistic forecasting controls
+LEAGUE_HR_PER_PA = 0.032
+MAX_REASONABLE_HR_PER_PA = 0.085
+PARK_FACTOR_STRENGTH = 0.35
+
 
 # ============================================================
 # BASIC HELPERS
@@ -389,20 +394,20 @@ def aging_multiplier(age):
     if pd.isna(age):
         return 1.00
     if age <= 23:
-        return 1.07
+        return 1.03
     if age <= 25:
-        return 1.05
-    if age <= 27:
         return 1.02
+    if age <= 27:
+        return 1.01
     if age <= 29:
         return 1.00
     if age <= 31:
-        return 0.97
+        return 0.98
     if age <= 33:
-        return 0.93
+        return 0.95
     if age <= 35:
-        return 0.88
-    return 0.82
+        return 0.91
+    return 0.86
 
 
 def projected_pa_from_history(player_hist):
@@ -415,7 +420,7 @@ def projected_pa_from_history(player_hist):
     pa_2023 = pa_2023.iloc[0] if len(pa_2023) else np.nan
 
     vals = np.array([pa_2025, pa_2024, pa_2023], dtype=float)
-    weights = np.array([0.60, 0.30, 0.10], dtype=float)
+    weights = np.array([0.55, 0.30, 0.15], dtype=float)
 
     mask = ~np.isnan(vals)
     if mask.sum() == 0:
@@ -429,23 +434,22 @@ def projected_pa_from_history(player_hist):
     pa_avg = player_hist["PA"].mean()
 
     if pd.notna(pa_avg):
-        pa = 0.80 * pa + 0.20 * pa_avg
+        pa = 0.75 * pa + 0.25 * pa_avg
 
     next_age = player_hist["Age"].max() + 1 if player_hist["Age"].notna().any() else np.nan
     if pd.notna(next_age):
         if next_age >= 34:
-            pa *= 0.94
+            pa *= 0.93
         elif next_age <= 25:
-            pa *= 1.03
+            pa *= 1.02
 
-    return float(np.clip(pa, 150, 725))
+    return float(np.clip(pa, 180, 700))
 
 
 def add_summary_features(player_hist, row, feature_list):
     for f in feature_list:
         if f in player_hist.columns:
-            vals = pd.to_numeric(player_hist[f], errors="coerce")
-            vals = vals.dropna()
+            vals = pd.to_numeric(player_hist[f], errors="coerce").dropna()
             if len(vals) > 0:
                 row[f + "_mean"] = vals.mean()
                 row[f + "_last"] = vals.iloc[-1]
@@ -459,6 +463,56 @@ def add_summary_features(player_hist, row, feature_list):
             row[f + "_last"] = np.nan
             row[f + "_trend"] = np.nan
     return row
+
+
+def weighted_recent_hr_rate(player_row):
+    r_last = player_row.get("HR_per_PA_last", np.nan)
+    r_mean = player_row.get("HR_per_PA_mean", np.nan)
+    trend = player_row.get("HR_per_PA_trend", 0.0)
+
+    vals = []
+    wts = []
+
+    if pd.notna(r_last):
+        vals.append(r_last)
+        wts.append(0.65)
+
+    if pd.notna(r_mean):
+        vals.append(r_mean)
+        wts.append(0.35)
+
+    if not vals:
+        base = LEAGUE_HR_PER_PA
+    else:
+        base = np.average(vals, weights=wts)
+
+    if pd.notna(trend):
+        base += 0.15 * trend
+
+    return float(base)
+
+
+def pa_based_shrinkage(projected_pa):
+    if pd.isna(projected_pa):
+        return 0.50
+    return float(np.clip(projected_pa / 700.0, 0.35, 0.85))
+
+
+def soft_cap_hr_rate(rate):
+    """
+    Softly compress elite HR rates instead of allowing crazy upside.
+    """
+    if pd.isna(rate):
+        return LEAGUE_HR_PER_PA
+
+    if rate <= 0.070:
+        return rate
+    elif rate <= 0.080:
+        return 0.070 + 0.70 * (rate - 0.070)
+    elif rate <= 0.090:
+        return 0.077 + 0.45 * (rate - 0.080)
+    else:
+        return 0.0815 + 0.20 * (rate - 0.090)
 
 
 def build_training_rows(df, target_year):
@@ -619,36 +673,62 @@ def project_2026(models, feature_cols, proj_df):
     pred_ridge = models["ridge"].predict(X)
 
     main_rate = (
-        0.32 * pred_rf +
-        0.28 * pred_gb +
-        0.25 * pred_et +
-        0.15 * pred_ridge
+        0.27 * pred_rf +
+        0.23 * pred_gb +
+        0.20 * pred_et +
+        0.30 * pred_ridge
     )
 
     xhr_cols = models["xhr_feature_cols"]
     xhr_rate = models["xhr_model"].predict(proj_df[xhr_cols].copy())
 
     main_rate_series = pd.Series(main_rate, index=proj_df.index)
+    xhr_rate_series = pd.Series(xhr_rate, index=proj_df.index)
 
     proxy_rate = proj_df["xHR_proxy_last"].fillna(
         proj_df["xHR_proxy_mean"]
     ).fillna(main_rate_series)
 
-    raw_rate = (
-        0.62 * main_rate +
-        0.23 * xhr_rate +
-        0.15 * proxy_rate
+    modeled_rate = (
+        0.58 * main_rate_series +
+        0.17 * xhr_rate_series +
+        0.10 * proxy_rate
     )
 
-    raw_rate = np.clip(raw_rate, 0.005, 0.12)
+    recent_baseline = proj_df.apply(weighted_recent_hr_rate, axis=1)
+    shrink = proj_df["Projected_PA"].apply(pa_based_shrinkage)
 
-    proj_df["HR_rate_raw"] = raw_rate
+    regressed_rate = (
+        shrink * modeled_rate +
+        (1 - shrink) * recent_baseline
+    )
+
+    regressed_rate = (
+        0.78 * regressed_rate +
+        0.22 * LEAGUE_HR_PER_PA
+    )
+
+    regressed_rate = regressed_rate.apply(soft_cap_hr_rate)
+    regressed_rate = np.clip(regressed_rate, 0.008, MAX_REASONABLE_HR_PER_PA)
+
+    proj_df["HR_rate_raw"] = modeled_rate
+    proj_df["HR_rate_regressed"] = regressed_rate
+
     proj_df["age_multiplier"] = proj_df["Age"].apply(aging_multiplier)
-    proj_df["HR_rate_age_adj"] = proj_df["HR_rate_raw"] * proj_df["age_multiplier"]
-    proj_df["HR_rate_final"] = proj_df["HR_rate_age_adj"] * proj_df["HR_Park_Index"]
+    proj_df["HR_rate_age_adj"] = proj_df["HR_rate_regressed"] * proj_df["age_multiplier"]
+
+    park_adj = 1.0 + (proj_df["HR_Park_Index"] - 1.0) * PARK_FACTOR_STRENGTH
+    proj_df["HR_rate_final"] = proj_df["HR_rate_age_adj"] * park_adj
+
+    proj_df["HR_rate_final"] = proj_df["HR_rate_final"].apply(soft_cap_hr_rate)
+    proj_df["HR_rate_final"] = np.clip(proj_df["HR_rate_final"], 0.008, MAX_REASONABLE_HR_PER_PA)
 
     proj_df["Projected_HR"] = proj_df["HR_rate_final"] * proj_df["Projected_PA"]
     proj_df["Projected_HR"] = np.clip(proj_df["Projected_HR"], 0, None)
+
+    # optional range columns for presentation
+    proj_df["Downside_HR"] = proj_df["Projected_HR"] * 0.88
+    proj_df["Upside_HR"] = proj_df["Projected_HR"] * 1.12
 
     output = proj_df[[
         "Name",
@@ -657,9 +737,12 @@ def project_2026(models, feature_cols, proj_df):
         "Projected_PA",
         "HR_Park_Factor",
         "HR_rate_raw",
+        "HR_rate_regressed",
         "age_multiplier",
         "HR_rate_final",
-        "Projected_HR"
+        "Projected_HR",
+        "Downside_HR",
+        "Upside_HR"
     ]].copy()
 
     output = output.sort_values("Projected_HR", ascending=False).reset_index(drop=True)
@@ -667,9 +750,12 @@ def project_2026(models, feature_cols, proj_df):
     output["Projected_PA"] = output["Projected_PA"].round(1)
     output["HR_Park_Factor"] = output["HR_Park_Factor"].round(1)
     output["HR_rate_raw"] = output["HR_rate_raw"].round(4)
+    output["HR_rate_regressed"] = output["HR_rate_regressed"].round(4)
     output["age_multiplier"] = output["age_multiplier"].round(3)
     output["HR_rate_final"] = output["HR_rate_final"].round(4)
     output["Projected_HR"] = output["Projected_HR"].round(1)
+    output["Downside_HR"] = output["Downside_HR"].round(1)
+    output["Upside_HR"] = output["Upside_HR"].round(1)
 
     return output
 
@@ -697,6 +783,7 @@ def main():
 
     output = project_2026(models, feature_cols, proj_df)
     output.to_csv(OUTPUT_FILE, index=False)
+    print(f"Saved projections to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
